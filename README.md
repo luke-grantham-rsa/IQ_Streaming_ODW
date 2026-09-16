@@ -5,8 +5,8 @@ First time?
 install rsxdwstreaming 
 >> python -m pip install rsxdwstreaming-3.0.2-py3-none-any.whl
 
-Run xdw_demo_gui
->> python -m rsxdwstreaming.examples.xdw_demo_gui
+Run GUI
+>> python -m Test_ODW.py
 
 Done?
 >> deactivate
