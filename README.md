@@ -6,7 +6,7 @@ install rsxdwstreaming
 >> python -m pip install rsxdwstreaming-3.0.2-py3-none-any.whl
 
 Run GUI
->> python -m Test_ODW.py
+>> python Test_ODW.py
 
 Done?
 >> deactivate
