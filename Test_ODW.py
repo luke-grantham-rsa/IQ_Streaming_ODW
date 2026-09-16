@@ -71,6 +71,10 @@ def plot_toa_profile(plot, toa_list, value_list):
     )
 
 
+MAX_PATHS = 8
+DEFAULT_PATHS = 2
+
+
 class XdwDemoGui(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -78,14 +82,47 @@ class XdwDemoGui(QMainWindow):
         self.left = 0
         self.top = 0
         self.width = 1500
-        self.height = 700
+        self.height = 740
         self.setWindowTitle(self.title)
         self.setGeometry(self.left, self.top, self.width, self.height)
         resolution = QGuiApplication.primaryScreen().availableGeometry()
         self.move(int((resolution.width() - self.width) / 2), int((resolution.height() - self.height) / 2))
 
-        self.tabs_widget = TabsWidget(self)
-        self.setCentralWidget(self.tabs_widget)
+        # Each Path tab is a fully independent TabsWidget - its own IP/Port/Protocol and
+        # its own Single/Transient/Import ODW state - so different profiles can be loaded
+        # onto different SMWs at once. Starts with DEFAULT_PATHS tabs plus a Chrome-style
+        # "+" tab that appends another Path (up to MAX_PATHS) when clicked.
+        self.instrument_tabs = QTabWidget()
+        self.tabs_widgets = []
+        for _ in range(DEFAULT_PATHS):
+            self.addPathTab()
+        self.instrument_tabs.setCurrentIndex(0)
+
+        self.plus_tab_widget = QWidget()
+        self.instrument_tabs.addTab(self.plus_tab_widget, "+")
+        self.instrument_tabs.tabBarClicked.connect(self.handleTabBarClicked)
+
+        self.setCentralWidget(self.instrument_tabs)
+
+    def addPathTab(self):
+        if len(self.tabs_widgets) >= MAX_PATHS:
+            return
+
+        tabs_widget = TabsWidget(None)
+        self.tabs_widgets.append(tabs_widget)
+
+        # Insert before the "+" tab, if it still exists (not present during initial setup)
+        plus_index = self.instrument_tabs.indexOf(self.plus_tab_widget) if hasattr(self, 'plus_tab_widget') else -1
+        insert_index = plus_index if plus_index != -1 else self.instrument_tabs.count()
+        self.instrument_tabs.insertTab(insert_index, tabs_widget, f"Path {len(self.tabs_widgets)}")
+        self.instrument_tabs.setCurrentIndex(insert_index)
+
+        if len(self.tabs_widgets) >= MAX_PATHS and hasattr(self, 'plus_tab_widget'):
+            self.instrument_tabs.removeTab(self.instrument_tabs.indexOf(self.plus_tab_widget))
+
+    def handleTabBarClicked(self, index):
+        if self.instrument_tabs.widget(index) is self.plus_tab_widget:
+            self.addPathTab()
 
 
 
@@ -122,6 +159,7 @@ class TabsWidget(QWidget):
         self.l_proto = QLabel("Protocol:")
         self.cb_proto = QComboBox()
         self.cb_proto.addItems(["TCP", "UDP"])
+        self.cb_proto.setFixedWidth(70)
         # self.b_connect = QPushButton("Connect")
         # self.b_connect.clicked.connect(self.connect)
         # self.state = QLabel(self)
@@ -131,12 +169,15 @@ class TabsWidget(QWidget):
         # interfaceInfoLayout.addWidget(self.l_interface_txt)
         interfaceInfoLayout.addWidget(self.l_ip)
         interfaceInfoLayout.addWidget(self.le_ip)
+        interfaceInfoLayout.addSpacing(20)
         interfaceInfoLayout.addWidget(self.l_port)
         interfaceInfoLayout.addWidget(self.le_port)
+        interfaceInfoLayout.addSpacing(20)
         interfaceInfoLayout.addWidget(self.l_proto)
         interfaceInfoLayout.addWidget(self.cb_proto)
         # interfaceInfoLayout.addWidget(self.b_connect)
         # interfaceInfoLayout.addWidget(self.state)
+        interfaceInfoLayout.addStretch(1)
 
         self.interfaceInfo.setLayout(interfaceInfoLayout)
 
