@@ -164,14 +164,20 @@ class TabsWidget(QWidget):
         self.tabs.currentWidget().SetToDefault()
 
     def sendxDW(self):
-        #todo: Loop for each numODW
         try:
             xDWinterfaceIP = self.le_ip.text()
             xDWinterfacePort = int(self.le_port.text())
             xDWinterfaceProtocol = self.cb_proto.currentText()
             xDWinterface = xdw_streaming.XdwStreaming(xDWinterfaceIP, xDWinterfacePort, xDWinterfaceProtocol)
-            xDW = self.tabs.currentWidget().createXdw()
-            xDWinterface.send_xdw(xDW)
+            print(f'Sending ODWs from tab {self.tabs.currentIndex()}')
+            if (self.tabs.currentIndex() == 1):
+                for index, _ in enumerate(self.tab_transient_odw.toa_list):
+                    xDW = self.tabs.currentWidget().createXdw(self.tab_transient_odw.toa_list[index], self.tab_transient_odw.phase_list[index])
+                    xDWinterface.send_xdw(xDW)
+            else:
+                xDW = self.tabs.currentWidget().createXdw()
+                xDWinterface.send_xdw(xDW)
+            print(f'ODWs sent to instrument at {self.le_ip.text()}')
         except ConnectionError:
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Icon.Critical)
@@ -393,7 +399,7 @@ class TransientOdwTab(QWidget):
 
         # Labels
         self.phase_plot.setLabel("bottom", "TOA")
-        self.phase_plot.setLabel("left", "Phase", units="°")
+        self.phase_plot.setLabel("left", "Phase Offset", units="°")
         self.phase_plot.setTitle("Phase Profile")
 
         # Enable grid
@@ -526,12 +532,13 @@ class TransientOdwTab(QWidget):
                    f"Problematic value: {lineedit.text()}"
         return ret
 
-    def createXdw(self):
+    def createXdw(self, toa, phase_offset):
         #todo. Need to loop for each NumTOA to execute this. TOA will be passed from the method call
-        toa = self.atof(self.lse_toa)
-
+        #toa = self.atof(self.lse_toa)
+        print(f'generating ODW with TOA: {toa} and phase: {phase_offset}')
         # Check all inputs valid (this has to be done manually, because doubles can be in state
         # QValidator::Intermediate, which is not valid as is but not blockable by the validator)
+        #todo: check validation of phase offset and toa
         inputsValid = True
         inputsValid = inputsValid & self.checkInput(self.ls_toa, self.lse_toa)
         inputsValid = inputsValid & self.checkInput(self.l_freqoffset, self.le_freqoffset)
@@ -544,7 +551,7 @@ class TransientOdwTab(QWidget):
 
         level_offset = self.atof(self.le_leveloffset)
         freq_offset = self.atof(self.le_freqoffset)
-        phase_offset = self.atof(self.lse_phaseoffset)  #start phase offset for now. todo
+        #phase_offset = self.atof(self.lse_phaseoffset)  #start phase offset for now. todo
 
         #if self.cb_toa.isChecked():
         new_odw = odw.Odw(toa=toa, level_offset=level_offset, freq_offset=freq_offset, phase_offset=phase_offset)
