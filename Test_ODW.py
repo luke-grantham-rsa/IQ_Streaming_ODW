@@ -1,12 +1,16 @@
 import csv
 import math
+import socket
 import sys
+import time
 import numpy as np
 import pyqtgraph as pg
 from rsxdwstreaming import xdw_streaming, odw
 
 from PyQt6.QtCore import (
     QLocale,
+    Qt,
+    QTimer,
 )
 
 from PyQt6.QtGui import (
@@ -31,6 +35,10 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QTabWidget,
     QVBoxLayout,
+    QSlider,
+    QDoubleSpinBox,
+    QScrollArea,
+    QGroupBox,
 )
 
 # TODO:
@@ -43,8 +51,12 @@ TOA_MAX_S = ((1 << 52) - 1) / 2.4e9
 FREQ_OFFSET_MIN_HZ = -2.4e9 / 2
 FREQ_OFFSET_MAX_HZ = 2.4e9 * (1 / 2 - 1 / (1 << 32))
 LEVEL_OFFSET_MIN_DB = 0
+LIVE_LEVEL_OFFSET_MAX_DB = 50
 PHASE_OFFSET_MIN_DEG = 0
 PHASE_OFFSET_MAX_DEG = 360 * (1 - 1 / (1 << 16))
+# QSlider positions are 32-bit. A 1 Hz step across ±1.2 GHz does not fit, so the
+# frequency slider tracks the numeric field in 10 Hz steps. The spin box is encoded.
+LIVE_FREQ_SLIDER_STEP_HZ = 10.0
 
 
 def build_toa_plot(name, unit, plot_unit=None):
@@ -88,10 +100,11 @@ class XdwDemoGui(QMainWindow):
         resolution = QGuiApplication.primaryScreen().availableGeometry()
         self.move(int((resolution.width() - self.width) / 2), int((resolution.height() - self.height) / 2))
 
-        # Each Path tab is a fully independent TabsWidget - its own IP/Port/Protocol and
-        # its own Single/Transient/Import ODW state - so different profiles can be loaded
-        # onto different SMWs at once. Starts with DEFAULT_PATHS tabs plus a Chrome-style
-        # "+" tab that appends another Path (up to MAX_PATHS) when clicked.
+        # Two top-level tabs. TOA is the timed editor: a sub-tab per SMW (up to
+        # MAX_PATHS), each with its own Single/Transient/Import state, plus a "+"
+        # tab that appends another Path. Live is last and streams ODWs with no TOA.
+        self.mode_tabs = QTabWidget()
+
         self.instrument_tabs = QTabWidget()
         self.tabs_widgets = []
         for _ in range(DEFAULT_PATHS):
@@ -101,8 +114,13 @@ class XdwDemoGui(QMainWindow):
         self.plus_tab_widget = QWidget()
         self.instrument_tabs.addTab(self.plus_tab_widget, "+")
         self.instrument_tabs.tabBarClicked.connect(self.handleTabBarClicked)
+        self.mode_tabs.addTab(self.instrument_tabs, "TOA")
 
-        self.setCentralWidget(self.instrument_tabs)
+        self.live_tab = LiveOdwTab()
+        self.mode_tabs.addTab(self.live_tab, "Live")
+
+        self.mode_tabs.setCurrentIndex(0)
+        self.setCentralWidget(self.mode_tabs)
 
     def addPathTab(self):
         if len(self.tabs_widgets) >= MAX_PATHS:
@@ -111,18 +129,23 @@ class XdwDemoGui(QMainWindow):
         tabs_widget = TabsWidget(None)
         self.tabs_widgets.append(tabs_widget)
 
-        # Insert before the "+" tab, if it still exists (not present during initial setup)
-        plus_index = self.instrument_tabs.indexOf(self.plus_tab_widget) if hasattr(self, 'plus_tab_widget') else -1
+        plus_index = self.instrument_tabs.indexOf(self.plus_tab_widget) if hasattr(self, "plus_tab_widget") else -1
         insert_index = plus_index if plus_index != -1 else self.instrument_tabs.count()
         self.instrument_tabs.insertTab(insert_index, tabs_widget, f"Path {len(self.tabs_widgets)}")
         self.instrument_tabs.setCurrentIndex(insert_index)
 
-        if len(self.tabs_widgets) >= MAX_PATHS and hasattr(self, 'plus_tab_widget'):
-            self.instrument_tabs.removeTab(self.instrument_tabs.indexOf(self.plus_tab_widget))
+        if len(self.tabs_widgets) >= MAX_PATHS and hasattr(self, "plus_tab_widget"):
+            plus_index = self.instrument_tabs.indexOf(self.plus_tab_widget)
+            if plus_index != -1:
+                self.instrument_tabs.removeTab(plus_index)
 
     def handleTabBarClicked(self, index):
         if self.instrument_tabs.widget(index) is self.plus_tab_widget:
             self.addPathTab()
+
+    def closeEvent(self, event):
+        self.live_tab.stop_streaming()
+        super().closeEvent(event)
 
 
 
@@ -822,6 +845,363 @@ class ImportOdwTab(QWidget):
     def createXdw(self, toa, freq_offset, level_offset, phase_offset):
         new_odw = odw.Odw(toa=toa, level_offset=level_offset, freq_offset=freq_offset, phase_offset=phase_offset)
         return new_odw.get_xdw()
+
+
+class _QuietSocket:
+    """Stand-in so XdwStreaming.__del__ does not shut down a socket we already closed."""
+
+    def shutdown(self, how):
+        return None
+
+    def close(self):
+        return None
+
+
+def close_xdw_interface(interface):
+    if interface is None:
+        return
+    sock = getattr(interface, "xdw_interface", None)
+    interface.xdw_interface = _QuietSocket()
+    if sock is None or isinstance(sock, _QuietSocket):
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _decimal_ceil(value, decimals):
+    factor = 10 ** decimals
+    return math.ceil(value * factor - 1e-6) / factor
+
+
+def _decimal_floor(value, decimals):
+    factor = 10 ** decimals
+    return math.floor(value * factor + 1e-6) / factor
+
+
+class LiveOffsetControl(QWidget):
+    """A slider kept in step with the numeric field that is actually encoded."""
+
+    def __init__(self, name, unit, minimum, maximum, decimals, single_step, slider_step):
+        super().__init__()
+        # Snap to the spin box resolution so Qt cannot round the end stop past the ICD limit
+        # (a phase of 360 does not fit in the 16-bit PHS field).
+        self.minimum = _decimal_ceil(minimum, decimals)
+        self.maximum = _decimal_floor(maximum, decimals)
+        self.slider_step = slider_step
+        self._syncing = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.label = QLabel(f"{name}: [{unit}]")
+        self.label.setMinimumWidth(220)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, self._to_slider(self.maximum))
+        self.slider.setSingleStep(max(1, int(round(single_step / slider_step))))
+
+        self.spin = QDoubleSpinBox()
+        self.spin.setLocale(QLocale("en"))
+        self.spin.setGroupSeparatorShown(False)
+        self.spin.setDecimals(decimals)
+        self.spin.setRange(self.minimum, self.maximum)
+        self.spin.setSingleStep(single_step)
+        self.spin.setValue(0.0 if self.minimum <= 0.0 <= self.maximum else self.minimum)
+        self.spin.setFixedWidth(160)
+
+        self.slider.valueChanged.connect(self._on_slider)
+        self.spin.valueChanged.connect(self._on_spin)
+        self.slider.setValue(self._to_slider(self.spin.value()))
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.spin)
+
+    def _to_slider(self, value):
+        max_steps = int(round((self.maximum - self.minimum) / self.slider_step))
+        steps = int(round((value - self.minimum) / self.slider_step))
+        return max(0, min(max_steps, steps))
+
+    def _from_slider(self, position):
+        value = self.minimum + position * self.slider_step
+        if value < self.minimum:
+            return self.minimum
+        if value > self.maximum:
+            return self.maximum
+        return value
+
+    def _on_slider(self, position):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.spin.setValue(self._from_slider(position))
+        self._syncing = False
+
+    def _on_spin(self, value):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.slider.setValue(self._to_slider(value))
+        self._syncing = False
+
+    def value(self):
+        value = self.spin.value()
+        if value < self.minimum:
+            return self.minimum
+        if value > self.maximum:
+            return self.maximum
+        return value
+
+
+class LiveDestinationRow(QGroupBox):
+    """One SMW: address fields plus the three offset controls."""
+
+    def __init__(self, remove_callback):
+        super().__init__("Instrument")
+        self.remove_callback = remove_callback
+        self.interface = None
+        self.connected_endpoint = None
+        self.failed_endpoint = None
+        self.retry_after = 0.0
+
+        outer = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("IP:"))
+        self.le_ip = QLineEdit("192.168.1.231")
+        self.le_ip.setFixedWidth(120)
+        self.le_ip.editingFinished.connect(self.on_endpoint_edited)
+        header.addWidget(self.le_ip)
+
+        header.addWidget(QLabel("Port:"))
+        self.le_port = QLineEdit("49152")
+        self.le_port.setFixedWidth(70)
+        self.le_port.setValidator(QIntValidator(1, 65535, self))
+        self.le_port.editingFinished.connect(self.on_endpoint_edited)
+        header.addWidget(self.le_port)
+
+        header.addWidget(QLabel("Protocol:"))
+        self.cb_proto = QComboBox()
+        self.cb_proto.addItems(["TCP", "UDP"])
+        self.cb_proto.setFixedWidth(70)
+        self.cb_proto.currentIndexChanged.connect(self.on_endpoint_edited)
+        header.addWidget(self.cb_proto)
+
+        self.status = QLabel("Idle")
+        self.status.setMinimumWidth(220)
+        header.addWidget(self.status, 1)
+
+        self.b_delete = QPushButton("Delete")
+        self.b_delete.clicked.connect(lambda: self.remove_callback(self))
+        header.addWidget(self.b_delete)
+        outer.addLayout(header)
+
+        self.freq = LiveOffsetControl(
+            "Frequency offset", "Hz",
+            FREQ_OFFSET_MIN_HZ, FREQ_OFFSET_MAX_HZ,
+            3, 1000.0, LIVE_FREQ_SLIDER_STEP_HZ,
+        )
+        self.level = LiveOffsetControl(
+            "Level offset (Attenuation)", "dB",
+            LEVEL_OFFSET_MIN_DB, LIVE_LEVEL_OFFSET_MAX_DB,
+            2, 0.1, 0.1,
+        )
+        self.phase = LiveOffsetControl(
+            "Phase offset", "deg",
+            PHASE_OFFSET_MIN_DEG, PHASE_OFFSET_MAX_DEG,
+            2, 0.1, 0.1,
+        )
+        outer.addWidget(self.freq)
+        outer.addWidget(self.level)
+        outer.addWidget(self.phase)
+
+    def endpoint(self):
+        return (self.le_ip.text().strip(), self.le_port.text().strip(), self.cb_proto.currentText())
+
+    def on_endpoint_edited(self, *_args):
+        if self.interface is not None and self.endpoint() != self.connected_endpoint:
+            self.close_interface()
+
+    def close_interface(self):
+        close_xdw_interface(self.interface)
+        self.interface = None
+        self.connected_endpoint = None
+
+    def set_status(self, text):
+        if self.status.text() != text:
+            self.status.setText(text)
+
+    def ensure_interface(self):
+        endpoint = self.endpoint()
+        if self.interface is not None and endpoint == self.connected_endpoint:
+            return
+        self.close_interface()
+        ip, port_text, protocol = endpoint
+        port = int(port_text)
+        # Probe first. XdwStreaming.__init__ leaves an unconnected socket behind when
+        # connect() fails, and its __del__ then raises on shutdown.
+        self._probe_connect(ip, port, protocol)
+        previous_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(1.0)
+        try:
+            self.interface = xdw_streaming.XdwStreaming(ip, port, protocol)
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
+        self.interface.xdw_interface.settimeout(1.0)
+        self.connected_endpoint = endpoint
+
+    @staticmethod
+    def _probe_connect(ip, port, protocol):
+        protocol = protocol.strip().upper()
+        if protocol == "TCP":
+            soc_type = socket.SOCK_STREAM
+        elif protocol == "UDP":
+            soc_type = socket.SOCK_DGRAM
+        else:
+            raise RuntimeError(f"unsupported protocol: {protocol}")
+        probe = socket.socket(socket.AF_INET, soc_type)
+        probe.settimeout(1.0)
+        try:
+            probe.connect((ip, int(port)))
+        except OSError as exc:
+            raise ConnectionError("Could not connect!") from exc
+        finally:
+            probe.close()
+
+    def send_odw(self):
+        """Send one ODW with no TOA so the SMW applies it when the word arrives."""
+        endpoint = self.endpoint()
+        now = time.monotonic()
+        if self.interface is None and self.failed_endpoint == endpoint and now < self.retry_after:
+            return
+        try:
+            self.ensure_interface()
+            # Omitting toa matches Single ODW with "Use TOA Mode" unchecked (toa stays 0).
+            packet = odw.Odw(
+                level_offset=self.level.value(),
+                freq_offset=self.freq.value(),
+                phase_offset=self.phase.value(),
+            ).get_xdw()
+            self.interface.send_xdw(packet)
+        except Exception as exc:
+            self.close_interface()
+            self.failed_endpoint = endpoint
+            self.retry_after = now + 1.0
+            self.set_status(f"Error: {exc}")
+            return
+        self.failed_endpoint = None
+        self.set_status("Sending")
+
+
+class LiveOdwTab(QWidget):
+    """Streams the current slider offsets to up to MAX_PATHS instruments at a fixed rate."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows = []
+        self.streaming = False
+
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Update rate: [Hz]"))
+        self.rate = QDoubleSpinBox()
+        self.rate.setLocale(QLocale("en"))
+        self.rate.setRange(1.0, 100.0)
+        self.rate.setDecimals(1)
+        self.rate.setSingleStep(1.0)
+        self.rate.setValue(10.0)
+        self.rate.valueChanged.connect(self.on_rate_changed)
+        controls.addWidget(self.rate)
+        self.b_start = QPushButton("Start")
+        self.b_start.clicked.connect(self.toggle_streaming)
+        controls.addWidget(self.b_start)
+        controls.addSpacing(20)
+        self.b_add = QPushButton()
+        self.b_add.clicked.connect(self.add_row)
+        controls.addWidget(self.b_add)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.rows_widget = QWidget()
+        self.rows_layout = QVBoxLayout(self.rows_widget)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.rows_widget)
+        layout.addWidget(scroll, 1)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.send_tick)
+        self.add_row()
+
+    def add_row(self):
+        if len(self.rows) >= MAX_PATHS:
+            return
+        row = LiveDestinationRow(self.remove_row)
+        self.rows.append(row)
+        self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+        self.updateAddButton()
+
+    def remove_row(self, row):
+        if row not in self.rows:
+            return
+        row.close_interface()
+        self.rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        self.updateAddButton()
+
+    def updateAddButton(self):
+        self.b_add.setText(f"Add Path ({len(self.rows)}/{MAX_PATHS})")
+        self.b_add.setEnabled(len(self.rows) < MAX_PATHS)
+
+    def on_rate_changed(self, rate):
+        if self.streaming:
+            self.timer.setInterval(self.interval_ms(rate))
+
+    def interval_ms(self, rate=None):
+        if rate is None:
+            rate = self.rate.value()
+        return max(1, int(round(1000.0 / rate)))
+
+    def toggle_streaming(self):
+        if self.streaming:
+            self.stop_streaming()
+        else:
+            self.start_streaming()
+
+    def start_streaming(self):
+        self.streaming = True
+        self.b_start.setText("Stop")
+        for row in self.rows:
+            row.failed_endpoint = None
+            row.retry_after = 0.0
+        self.timer.start(self.interval_ms())
+        self.send_tick()
+
+    def stop_streaming(self):
+        self.streaming = False
+        self.timer.stop()
+        self.b_start.setText("Start")
+        for row in self.rows:
+            row.close_interface()
+            row.failed_endpoint = None
+            row.retry_after = 0.0
+            row.set_status("Idle")
+
+    def send_tick(self):
+        for row in list(self.rows):
+            row.send_odw()
 
 
 def main():
