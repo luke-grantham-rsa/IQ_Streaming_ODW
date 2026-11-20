@@ -1,7 +1,7 @@
 Run the GUI
 From a fresh Command Prompt:
 
->> cd C:\Users\grantham\Documents\IQ_Streaming_ODW
+>> cd <path-to-cloned-repo>
 >> run_gui.bat
 
 That is the only step after cloning the repo. run_gui.bat uses the system Python
