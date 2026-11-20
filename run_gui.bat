@@ -1,7 +1,6 @@
 @echo off
 rem Launches Test_ODW.py with the system Python. The libraries ship in this repo under
 rem xdw\Lib\site-packages, so a fresh clone runs with no extra download.
-rem Do not use xdw\Scripts\python.exe: it points to a Python 3.12 install that is not present.
 setlocal
 cd /d "%~dp0"
 

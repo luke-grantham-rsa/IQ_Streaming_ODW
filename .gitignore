@@ -1,0 +1,4 @@
+# Virtual environment launcher. It embeds the path to whoever created it, so it is
+# not part of the repo. The libraries under xdw/Lib/site-packages are tracked.
+xdw/Scripts/
+xdw/pyvenv.cfg
